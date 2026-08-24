@@ -29,8 +29,24 @@ import (
 const (
 	Version                       = "2.7.9" // the current server version.
 	defaultSysTopicInterval int64 = 1       // the interval between $SYS topic publishes
-	LocalListener                 = "local"
-	InlineClientId                = "inline"
+
+	// SysTopicsDisabled를 Options.SysTopicResendInterval에 주면 $SYS 토픽 발행을 아예 끈다
+	// (D-TEG 20260824 추가, 기본값은 상류와 동일한 1초 주기).
+	//
+	// 상류는 접속 클라이언트가 0명이어도 매초 $SYS 20개 토픽을 발행하고, 그 값들이 retained로
+	// 남아 매초 도는 retained 만료 청소기(clearExpiredRetainedMessages → Packets.GetAll)의
+	// 복사 대상이 된다. $SYS를 구독하지 않는 배치에서는 이 둘이 통째로 헛돔이다.
+	// 실측(CDN, 접속 0명·2일 15시간): eventLoop 누적 할당 6,546MB = 2.42GB/일이고
+	// 그중 retained 청소기가 66%, $SYS 발행이 32%였다. 이 옵션을 켜면 발행이 사라지고
+	// retained가 비게 되어 청소기의 맵 복사도 함께 없어진다.
+	//
+	// 주의: 끄면 publishSysTopics가 갱신하던 Server.Info의 파생 필드
+	// (MemoryAlloc·Threads·Time·Uptime·ClientsTotal·ClientsDisconnected)가 갱신되지 않는다.
+	// 접속·패킷 카운터처럼 다른 경로에서 atomic으로 올리는 필드는 그대로 살아 있다.
+	// OnSysInfoTick 훅도 호출되지 않으므로, 그 훅이나 $SYS를 쓰는 배치에서는 켜지 말 것.
+	SysTopicsDisabled int64 = -1
+	LocalListener           = "local"
+	InlineClientId          = "inline"
 )
 
 var (
@@ -192,7 +208,7 @@ func New(opts *Options) *Server {
 		Topics:    NewTopicsIndex(),
 		Listeners: listeners.New(),
 		loop: &loop{
-			sysTopics:      time.NewTicker(time.Second * time.Duration(opts.SysTopicResendInterval)),
+			sysTopics:      newSysTopicsTicker(opts.SysTopicResendInterval),
 			clientExpiry:   time.NewTicker(time.Second),
 			inflightExpiry: time.NewTicker(time.Second),
 			retainedExpiry: time.NewTicker(time.Second),
@@ -378,10 +394,33 @@ func (s *Server) Serve() error {
 
 	go s.eventLoop()                            // spin up event loop for issuing $SYS values and closing server.
 	s.Listeners.ServeAll(s.EstablishConnection) // start listening on all listeners.
-	s.publishSysTopics()                        // begin publishing $SYS system values.
+	if s.sysTopicsEnabled() {
+		s.publishSysTopics() // begin publishing $SYS system values.
+	}
 	s.hooks.OnStarted()
 
 	return nil
+}
+
+// sysTopicsEnabled: $SYS 발행이 켜져 있는지. SysTopicsDisabled(음수)면 꺼진 것으로 본다.
+func (s *Server) sysTopicsEnabled() bool {
+	return s.Options.SysTopicResendInterval >= 0
+}
+
+// newSysTopicsTicker: $SYS 발행 티커를 만든다.
+//
+// 비활성(음수)일 때 nil을 돌려주지 않는 이유는 eventLoop의 select가 s.loop.sysTopics.C를
+// 무조건 참조하기 때문이다 — 포인터가 nil이면 그 필드 접근에서 패닉이 난다. 그렇다고
+// time.NewTicker에 음수를 그대로 넘길 수도 없다(NewTicker는 0 이하에서 패닉한다).
+// 그래서 유효한 티커를 만든 뒤 곧바로 Stop()해 채널이 영원히 조용하도록 둔다 —
+// select는 그 case에서 그냥 대기만 하게 되고, done 처리의 Stop() 재호출도 안전하다.
+func newSysTopicsTicker(interval int64) *time.Ticker {
+	if interval < 0 {
+		t := time.NewTicker(time.Hour) // 주기값 자체는 의미 없음
+		t.Stop()
+		return t
+	}
+	return time.NewTicker(time.Second * time.Duration(interval))
 }
 
 // eventLoop loops forever, running various server housekeeping methods at different intervals.
