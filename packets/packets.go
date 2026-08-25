@@ -182,7 +182,27 @@ type Subscription struct {
 }
 
 // Copy creates a new instance of a packet, but with an empty header for inheriting new QoS flags, etc.
+// CopySharePayload는 Copy와 같지만 Payload를 복제하지 않고 슬라이스를 그대로 공유한다
+// (D-TEG 20260825 추가).
+//
+// 구독자마다 호출되는 publishToClient가 Copy로 페이로드를 통째로 복제하는데, 그 뒤로
+// out.Payload를 수정하는 코드는 없다 — 쓰기(WritePacket)와 QoS>0 인플라이트 보관(읽기
+// 전용)에만 쓰인다. 따라서 발행측이 페이로드 버퍼를 재사용하지 않는 배치에서는 이 복제가
+// 순수 낭비다. 실측(D-TEG CDN): 512KB 발행 1건에서 복사만 59.9µs/524KB로 전체의 47%였고,
+// 사이트 브로드캐스트는 구독자 수에 비례해 반복된다.
+//
+// ⚠️ 발행 후 페이로드 버퍼를 재사용·수정하는 코드가 있으면 다른 구독자에게 깨진 데이터가
+// 나간다. 그래서 기본값이 아니라 Options.SharePublishPayload로 명시적으로 켜야 한다.
+func (pk *Packet) CopySharePayload(allowTransfer bool) Packet {
+	return pk.copyWith(allowTransfer, true)
+}
+
+// Copy는 Payload를 포함해 전부 복제한다(상류 동작 그대로).
 func (pk *Packet) Copy(allowTransfer bool) Packet {
+	return pk.copyWith(allowTransfer, false)
+}
+
+func (pk *Packet) copyWith(allowTransfer, sharePayload bool) Packet {
 	p := Packet{
 		FixedHeader: FixedHeader{
 			Remaining: pk.FixedHeader.Remaining,
@@ -239,7 +259,11 @@ func (pk *Packet) Copy(allowTransfer bool) Packet {
 	}
 
 	if len(pk.Payload) > 0 {
-		p.Payload = append([]byte{}, pk.Payload...)
+		if sharePayload {
+			p.Payload = pk.Payload // 복제하지 않고 공유 — 아래로는 읽기만 한다
+		} else {
+			p.Payload = append([]byte{}, pk.Payload...)
+		}
 	}
 
 	if len(pk.ReasonCodes) > 0 {

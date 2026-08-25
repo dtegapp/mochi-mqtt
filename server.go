@@ -146,6 +146,19 @@ type Options struct {
 	// with negligible performance difference (disabled by default to prevent confusion in statistics).
 	InlineClient bool `yaml:"inline_client" json:"inline_client"`
 
+	// SharePublishPayload는 구독자에게 전달할 패킷을 만들 때 페이로드를 복제하지 않고
+	// 슬라이스를 공유한다(D-TEG 20260825 추가, 기본 false = 상류 동작 그대로).
+	//
+	// publishToClient는 구독자마다 pk.Copy로 페이로드를 통째로 복제하는데, 그 뒤로
+	// out.Payload를 수정하는 코드가 없다 — 쓰기와 QoS>0 인플라이트 보관(읽기 전용)뿐이다.
+	// 실측(D-TEG CDN): 512KB 발행 1건에서 복사만 59.9µs/524KB로 전체의 47%였고,
+	// 사이트 브로드캐스트는 구독자 수에 비례해 반복된다. SplitPublishWrite가 없앤 것은
+	// "쓰기 버퍼" 복사이고 이건 그보다 앞단이라 따로 남아 있었다.
+	//
+	// ⚠️ 켜기 전 조건: 발행측이 InjectPacket/Publish 호출 이후 그 페이로드 버퍼를
+	// 재사용하거나 수정하지 않아야 한다. 어기면 다른 구독자에게 깨진 데이터가 나간다.
+	SharePublishPayload bool `yaml:"share_publish_payload" json:"share_publish_payload"`
+
 	// SplitPublishWrite는 PUBLISH를 보낼 때 헤더와 페이로드를 하나의 연속 버퍼로 합치지 않고
 	// net.Buffers로 함께 내보낸다(D-TEG 20260821 추가, 기본 false = 상류 동작 그대로).
 	//
@@ -1078,7 +1091,14 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		return pk, nil // [MQTT-3.8.3-3]
 	}
 
-	out := pk.Copy(false)
+	// SharePublishPayload가 켜져 있으면 페이로드를 복제하지 않고 공유한다.
+	// 아래로 out.Payload를 수정하는 코드는 없다(쓰기와 인플라이트 보관 모두 읽기 전용).
+	var out packets.Packet
+	if s.Options.SharePublishPayload {
+		out = pk.CopySharePayload(false)
+	} else {
+		out = pk.Copy(false)
+	}
 	if !s.hooks.OnACLCheck(cl, pk.TopicName, false) {
 		return out, packets.ErrNotAuthorized
 	}
