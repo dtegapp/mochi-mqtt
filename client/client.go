@@ -87,6 +87,10 @@ type Client struct {
 
 	recv chan *packets.Packet
 	done chan struct{}
+
+	// cbwg: 접속·단절 통지가 끝났는지 추적한다. Close가 이걸 기다려야 호출부가
+	// 정리한 상태를 뒤늦은 통지가 다시 건드리지 않는다.
+	cbwg sync.WaitGroup
 }
 
 // New는 클라이언트를 만든다. 실제 접속은 Start에서 한다.
@@ -136,13 +140,16 @@ func (c *Client) Start() error {
 	return err
 }
 
-// Close는 세션을 끝낸다. 재연결 루프도 멈춘다.
+// Close는 세션을 끝낸다. 재연결 루프도 멈추고, 진행 중인 접속·단절 통지가 끝날
+// 때까지 기다린다 — 기다리지 않으면 호출부가 정리한 상태를 뒤늦은 통지가 건드린다.
+// 통지 함수 안에서 부르면 안 된다(스스로를 기다리게 된다).
 func (c *Client) Close() {
 	if c.closed.Swap(true) {
 		return
 	}
 	close(c.done)
 	c.disconnect(ErrClosed)
+	c.cbwg.Wait()
 }
 
 // keeper는 연결이 끊긴 동안 재접속을 반복한다.
@@ -222,7 +229,8 @@ func (c *Client) dial() error {
 	}
 
 	if c.opt.OnConnect != nil {
-		go c.opt.OnConnect(c)
+		c.cbwg.Add(1)
+		go func() { defer c.cbwg.Done(); c.opt.OnConnect(c) }()
 	}
 	return nil
 }
@@ -278,7 +286,8 @@ func (c *Client) disconnect(cause error) {
 	c.reqmu.Unlock()
 
 	if c.opt.OnDisconnect != nil {
-		go c.opt.OnDisconnect(c, cause)
+		c.cbwg.Add(1)
+		go func() { defer c.cbwg.Done(); c.opt.OnDisconnect(c, cause) }()
 	}
 }
 
