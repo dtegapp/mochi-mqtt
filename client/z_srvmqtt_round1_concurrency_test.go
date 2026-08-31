@@ -125,10 +125,11 @@ func TestRound1_DialHasNoConcurrencyGuard(t *testing.T) {
 func TestRound1_StartBlocksOnMissingSuback(t *testing.T) {
 	b := newSlowBroker(t, 0) // CONNACK은 바로, SUBACK은 영영 주지 않는다
 	c := New(Options{
-		Addr:       b.addr(),
-		ClientId:   "srv-round1b",
-		AckTimeout: 400 * time.Millisecond, // 실제 기본값은 10초
-		RetryWait:  time.Hour,
+		Addr:             b.addr(),
+		ClientId:         "srv-round1b",
+		AckTimeout:       400 * time.Millisecond, // 실제 기본값은 10초
+		RetryWait:        time.Hour,
+		RequireSubscribe: true, // 서버간은 구독이 걸려야 의미가 있다
 	})
 	defer c.Close()
 
@@ -148,8 +149,10 @@ func TestRound1_StartBlocksOnMissingSuback(t *testing.T) {
 		t.Logf("이번 실행에서는 재현되지 않음(%v)", elapsed)
 	}
 	if c.IsConnected() {
-		t.Logf("재현됨: 구독이 하나도 걸리지 않았는데 접속은 성공으로 남아 있다 — " +
+		t.Log("재현됨: 구독이 하나도 걸리지 않았는데 접속은 성공으로 남아 있다 — " +
 			"붙어는 있는데 명령을 받지 못하는 상태가 조용히 만들어진다")
+	} else {
+		t.Log("확인됨: 구독을 걸지 못하자 접속을 취소했다 — 재시도에 맡긴다")
 	}
 }
 

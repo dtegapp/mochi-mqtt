@@ -99,17 +99,17 @@ func TestRound2_NoIOReadWriteDeadline(t *testing.T) {
 	}
 	src := string(buf)
 
-	if strings.Contains(src, "SetWriteDeadline") {
-		t.Log("쓰기 기한을 거는 호출이 있다")
+	if strings.Contains(src, "SetWriteDeadline(time.Now().Add(c.opt.WriteTimeout))") {
+		t.Log("확인됨: 모든 쓰기에 기한을 건다")
 	} else {
-		t.Log("재현됨: SetWriteDeadline 호출이 없다 — 상대가 읽지 않으면 발행이 무한정 잡히고, " +
+		t.Log("재현됨: 쓰기 기한이 없다 — 상대가 읽지 않으면 발행이 무한정 잡히고, " +
 			"쓰기 락을 쥔 채라 그 연결의 모든 송신이 함께 멈춘다")
 	}
 
-	// 접속 뒤 기한을 해제하고 다시 걸지 않는지 확인한다.
-	if strings.Contains(src, "SetDeadline(time.Time{})") && !strings.Contains(src, "SetReadDeadline") {
-		t.Log("재현됨: 접속 뒤 기한을 해제하고 읽기 기한을 다시 걸지 않는다 — " +
-			"상대가 조용히 사라져도 읽기가 영원히 대기한다")
+	if strings.Contains(src, "SetReadDeadline(time.Now().Add(c.readLimit))") {
+		t.Log("확인됨: 다음 패킷마다 읽기 기한을 다시 건다 — 조용한 단절을 이 기한이 잡는다")
+	} else {
+		t.Log("재현됨: 읽기 기한을 걸지 않는다 — 상대가 조용히 사라져도 영원히 대기한다")
 	}
 }
 
@@ -131,14 +131,14 @@ func TestRound2_NoPingRespTimeout(t *testing.T) {
 		t.Fatalf("접속 실패: %v", err)
 	}
 
-	// keepalive 주기의 여러 배를 기다린다 — 규격대로면 1.5배 안에 끊어야 한다.
-	time.Sleep(4 * time.Second)
+	// 읽기 기한(keepalive 2배)을 넘겨 기다린다.
+	time.Sleep(6 * time.Second)
 
 	if c.IsConnected() {
 		t.Logf("재현됨: PINGRESP를 %s 동안 한 번도 받지 못했는데 접속 표시가 그대로다 — "+
-			"keepalive 응답을 확인하지 않아 조용한 단절을 못 잡는다", 4*time.Second)
+			"keepalive 응답을 확인하지 않아 조용한 단절을 못 잡는다", 6*time.Second)
 	} else {
-		t.Logf("접속 표시가 내려갔다 — 응답 확인이 동작한다")
+		t.Logf("확인됨: 응답이 끊기자 접속 표시가 내려갔다 — 읽기 기한이 조용한 단절을 잡는다")
 	}
 }
 
@@ -160,17 +160,22 @@ func TestRound2_ReadHasNoSizeLimit(t *testing.T) {
 	}()
 
 	done := make(chan struct{})
+	var readErr error
 	go func() {
 		defer close(done)
 		br := bufio.NewReaderSize(cli, 4096)
-		_, _ = readPacket(br) // 본문을 기다리며 200MB를 미리 잡는다
+		// 운영 경로(readLoop)와 같은 상한으로 읽는다.
+		_, readErr = readPacketLimit(br, 16<<20)
 	}()
 
 	select {
 	case <-done:
-		t.Log("읽기가 곧바로 끝났다")
+		if readErr != nil && strings.Contains(readErr.Error(), "too large") {
+			t.Logf("확인됨: 상한을 넘는 패킷을 거절한다 — %v", readErr)
+		} else {
+			t.Logf("읽기가 끝났다: %v", readErr)
+		}
 	case <-time.After(700 * time.Millisecond):
-		t.Logf("재현됨: 남은 길이를 검사 없이 받아들여 그 크기만큼 미리 할당한 채 본문을 기다린다 — " +
-			"상한이 없다")
+		t.Log("재현됨: 남은 길이를 검사 없이 받아들여 그 크기만큼 미리 할당한 채 본문을 기다린다")
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,12 @@ type Options struct {
 	AckTimeout   time.Duration // QoS1 PUBACK·SUBACK 대기. 0이면 10초
 	RetryWait    time.Duration // 재연결 간격. 0이면 5초
 	ConnTimeout  time.Duration // TCP dial + CONNACK 대기. 0이면 10초
+	WriteTimeout time.Duration // 한 패킷을 내보내는 기한. 0이면 30초
+	MaxPacketSize int          // 받아들일 최대 패킷 크기(바이트). 0이면 16MB
+
+	// RequireSubscribe가 참이면 구독을 하나라도 걸지 못했을 때 접속을 실패로 본다.
+	// 붙어는 있는데 아무것도 받지 못하는 상태를 만들지 않으려는 것이다.
+	RequireSubscribe bool
 	OnConnect    func(*Client)
 	OnDisconnect func(*Client, error)
 	OnLog        func(format string, a ...any)
@@ -88,6 +95,10 @@ type Client struct {
 	recv chan *packets.Packet
 	done chan struct{}
 
+	// readLimit: 이 시간 동안 아무 패킷도 오지 않으면 끊긴 것으로 본다.
+	// PINGRESP도 패킷이므로, 이 기한이 곧 keepalive 응답을 확인하는 장치다.
+	readLimit time.Duration
+
 	// cbwg: 접속·단절 통지가 끝났는지 추적한다. Close가 이걸 기다려야 호출부가
 	// 정리한 상태를 뒤늦은 통지가 다시 건드리지 않는다.
 	cbwg sync.WaitGroup
@@ -107,12 +118,30 @@ func New(opt Options) *Client {
 	if opt.ConnTimeout == 0 {
 		opt.ConnTimeout = 10 * time.Second
 	}
+	if opt.WriteTimeout == 0 {
+		opt.WriteTimeout = 30 * time.Second
+	}
+	if opt.MaxPacketSize == 0 {
+		opt.MaxPacketSize = 16 << 20 // 16MB — 서버간 최대 페이로드(스냅샷·MDT)를 넉넉히 덮는다
+	}
 	return &Client{
-		opt:  opt,
+		opt: opt,
+		// 살아 있으면 keepalive 절반 주기마다 PINGREQ가 나가고 PINGRESP가 돌아온다.
+		// 두 주기 동안 아무것도 없으면 조용히 끊긴 것으로 본다.
+		readLimit: time.Duration(opt.Keepalive) * time.Second * 2,
 		acks: make(map[uint16]chan byte),
 		reqs: make(map[string]chan *packets.Packet),
 		recv: make(chan *packets.Packet, 256),
 		done: make(chan struct{}),
+	}
+}
+
+// guard는 고루틴·콜백에서 올라온 패닉을 붙잡아 로그로 바꾼다. 이 클라이언트가
+// 띄우는 고루틴은 전부 이걸 통과해야 한다 — 하나라도 맨몸이면 호출부가 등록한
+// 핸들러의 패닉이 프로세스 전체를 내린다.
+func (c *Client) guard(where string) {
+	if v := recover(); v != nil {
+		c.logf("mqtt client panic recovered (%s): %v\n%s", where, v, debug.Stack())
 	}
 }
 
@@ -140,20 +169,37 @@ func (c *Client) Start() error {
 	return err
 }
 
-// Close는 세션을 끝낸다. 재연결 루프도 멈추고, 진행 중인 접속·단절 통지가 끝날
-// 때까지 기다린다 — 기다리지 않으면 호출부가 정리한 상태를 뒤늦은 통지가 건드린다.
-// 통지 함수 안에서 부르면 안 된다(스스로를 기다리게 된다).
+// Close는 세션을 끝낸다. 재연결 루프도 멈추고, 진행 중인 접속·단절 통지가 끝나기를
+// 잠시 기다린다 — 기다리지 않으면 호출부가 정리한 상태를 뒤늦은 통지가 건드린다.
+//
+// 통지 함수 안에서 불러도 멈추지 않는다. 그 경우 자기 자신을 기다리게 되므로
+// 기한을 두고 그냥 진행한다.
 func (c *Client) Close() {
 	if c.closed.Swap(true) {
 		return
 	}
 	close(c.done)
 	c.disconnect(ErrClosed)
-	c.cbwg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		defer c.guard("Close.wait")
+		c.cbwg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(closeWaitLimit):
+		c.logf("mqtt close: 통지가 끝나기를 기다리다 %s가 지나 그대로 진행한다(통지 안에서 Close를 불렀을 수 있다)", closeWaitLimit)
+	}
 }
+
+// closeWaitLimit: Close가 진행 중인 통지를 기다리는 한도.
+const closeWaitLimit = 2 * time.Second
 
 // keeper는 연결이 끊긴 동안 재접속을 반복한다.
 func (c *Client) keeper() {
+	defer c.guard("keeper")
 	for {
 		select {
 		case <-c.done:
@@ -202,7 +248,10 @@ func (c *Client) dial() error {
 		conn.Close()
 		return fmt.Errorf("%w: reason=0x%02x", ErrRejected, pk.ReasonCode)
 	}
-	conn.SetDeadline(time.Time{})
+	// 접속 기한은 풀되 읽기 기한은 계속 건다 — 풀어 두면 상대가 조용히 사라져도
+	// 읽기가 영원히 대기하고, 그동안 붙어 있다고 믿는다.
+	conn.SetWriteDeadline(time.Time{})
+	conn.SetReadDeadline(time.Now().Add(c.readLimit))
 
 	c.wmu.Lock()
 	c.conn = conn
@@ -213,9 +262,11 @@ func (c *Client) dial() error {
 	go c.pinger(conn)
 
 	// 응답 토픽과 기존 구독을 되건다 — 재연결 때 조용히 수신이 끊기는 걸 막는다.
+	var subErr error
 	if c.opt.ResponseTopic != "" {
 		if err := c.sendSubscribe(c.opt.ResponseTopic, 1); err != nil {
 			c.logf("mqtt resubscribe(response) %s: %v", c.opt.ResponseTopic, err)
+			subErr = err
 		}
 	}
 	c.submu.RLock()
@@ -225,12 +276,25 @@ func (c *Client) dial() error {
 	for _, s := range subs {
 		if err := c.sendSubscribe(s.filter, s.qos); err != nil {
 			c.logf("mqtt resubscribe %s: %v", s.filter, err)
+			subErr = err
 		}
+	}
+
+	// 구독을 걸지 못한 채로 붙어 있으면 "연결은 됐는데 아무것도 받지 못하는" 상태가
+	// 된다. 겉으로는 정상이라 어디에도 드러나지 않으므로, 접속 자체를 실패로 돌려
+	// 재시도에 맡긴다.
+	if subErr != nil && c.opt.RequireSubscribe {
+		c.disconnect(subErr)
+		return fmt.Errorf("mqtt client: 구독을 걸지 못해 접속을 취소한다: %w", subErr)
 	}
 
 	if c.opt.OnConnect != nil {
 		c.cbwg.Add(1)
-		go func() { defer c.cbwg.Done(); c.opt.OnConnect(c) }()
+		go func() {
+			defer c.cbwg.Done()
+			defer c.guard("OnConnect")
+			c.opt.OnConnect(c)
+		}()
 	}
 	return nil
 }
@@ -287,14 +351,24 @@ func (c *Client) disconnect(cause error) {
 
 	if c.opt.OnDisconnect != nil {
 		c.cbwg.Add(1)
-		go func() { defer c.cbwg.Done(); c.opt.OnDisconnect(c, cause) }()
+		go func() {
+			defer c.cbwg.Done()
+			defer c.guard("OnDisconnect")
+			c.opt.OnDisconnect(c, cause)
+		}()
 	}
 }
 
 // readLoop는 소켓에서 패킷을 읽어 종류별로 나눈다. 연결이 끊기면 반환한다.
 func (c *Client) readLoop(conn net.Conn, br *bufio.Reader) {
+	defer c.guard("readLoop")
 	for {
-		pk, err := readPacket(br)
+		// 다음 패킷을 기다릴 기한. 정상 상태라면 keepalive 주기마다 최소 PINGRESP가 온다.
+		if err := conn.SetReadDeadline(time.Now().Add(c.readLimit)); err != nil {
+			c.disconnect(err)
+			return
+		}
+		pk, err := readPacketLimit(br, c.opt.MaxPacketSize)
 		if err != nil {
 			if !c.closed.Load() {
 				c.logf("mqtt read %s: %v", c.opt.Addr, err)
@@ -360,6 +434,7 @@ func (c *Client) onPublish(pk *packets.Packet) {
 
 // dispatchLoop는 수신 메시지를 순서대로 핸들러에 넘긴다.
 func (c *Client) dispatchLoop() {
+	defer c.guard("dispatchLoop")
 	for {
 		select {
 		case <-c.done:
@@ -370,7 +445,10 @@ func (c *Client) dispatchLoop() {
 	}
 }
 
+// dispatch는 등록된 수신 핸들러를 부른다. 핸들러 패닉이 여기서 멈추지 않으면
+// 이 고루틴이 죽고, 그게 곧 프로세스 종료다.
 func (c *Client) dispatch(pk *packets.Packet) {
+	defer c.guard("dispatch:" + pk.TopicName)
 	c.submu.RLock()
 	subs := make([]subscription, len(c.subs))
 	copy(subs, c.subs)
@@ -403,6 +481,7 @@ func (c *Client) onAck(pk *packets.Packet) {
 
 // pinger는 keepalive의 절반 주기로 PINGREQ를 보낸다.
 func (c *Client) pinger(conn net.Conn) {
+	defer c.guard("pinger")
 	iv := time.Duration(c.opt.Keepalive) * time.Second / 2
 	if iv < time.Second {
 		iv = time.Second
@@ -636,12 +715,23 @@ func (c *Client) writeTo(conn net.Conn, pk *packets.Packet) error {
 
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	// 기한이 없으면 상대가 읽지 않을 때 이 쓰기가 무한정 잡히고, 락을 쥔 채라
+	// 그 연결의 모든 송신(PUBACK·PINGREQ 포함)이 함께 멈춘다.
+	if err := conn.SetWriteDeadline(time.Now().Add(c.opt.WriteTimeout)); err != nil {
+		return err
+	}
 	_, err = conn.Write(buf.Bytes())
 	return err
 }
 
-// readPacket은 소켓에서 패킷 하나를 읽어 낸다.
+// readPacket은 소켓에서 패킷 하나를 읽어 낸다(크기 제한 없음 — 접속 단계 전용).
 func readPacket(br *bufio.Reader) (*packets.Packet, error) {
+	return readPacketLimit(br, 0)
+}
+
+// readPacketLimit은 최대 크기를 넘는 패킷을 거절한다. 남은 길이를 그대로 믿고
+// 할당하면 상대가 잘못된 값 하나로 최대 256MB를 잡게 만들 수 있다.
+func readPacketLimit(br *bufio.Reader, maxSize int) (*packets.Packet, error) {
 	hb, err := br.ReadByte()
 	if err != nil {
 		return nil, err
@@ -655,6 +745,9 @@ func readPacket(br *bufio.Reader) (*packets.Packet, error) {
 		return nil, err
 	}
 	pk.FixedHeader.Remaining = n
+	if maxSize > 0 && n > maxSize {
+		return nil, fmt.Errorf("mqtt client: packet too large: %d > %d", n, maxSize)
+	}
 
 	body := make([]byte, n)
 	if n > 0 {

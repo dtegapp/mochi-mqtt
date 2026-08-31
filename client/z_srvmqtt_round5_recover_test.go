@@ -45,7 +45,8 @@ func TestRound5_NoRecoverInClientGoroutines(t *testing.T) {
 		if end < 0 {
 			continue
 		}
-		if !strings.Contains(src[loc[0]:loc[0]+end], "recover()") {
+		body := src[loc[0] : loc[0]+end]
+		if !strings.Contains(body, "recover()") && !strings.Contains(body, "c.guard(") {
 			missing = append(missing, fn)
 		}
 	}
@@ -53,9 +54,11 @@ func TestRound5_NoRecoverInClientGoroutines(t *testing.T) {
 		t.Logf("재현됨: 복구 처리가 없는 고루틴 %d개 — %v", len(missing), missing)
 	}
 
-	if strings.Contains(src, "go func() { defer c.cbwg.Done(); c.opt.OnConnect(c) }()") &&
-		!strings.Contains(src, "OnConnect(c) }(); recover") {
+	if !strings.Contains(src, `c.guard("OnConnect")`) || !strings.Contains(src, `c.guard("OnDisconnect")`) {
 		t.Log("재현됨: 접속·단절 통지를 감싸는 복구 처리가 없다 — 통지 함수가 패닉하면 프로세스가 내려간다")
+	}
+	if len(missing) == 0 && strings.Contains(src, `c.guard("OnConnect")`) {
+		t.Log("확인됨: 고루틴 5개와 접속·단절 통지에 모두 복구 처리가 있다")
 	}
 }
 
@@ -93,10 +96,11 @@ func TestRound5_HandlerPanicPropagates(t *testing.T) {
 // 자기 자신을 기다린다. 주석에는 적어 뒀지만 코드로 막지는 않는다 — 호출부가
 // 단절 통지에서 정리하려다 걸릴 수 있는 자리다.
 func TestRound5_CloseInsideDisconnectCallbackDeadlocks(t *testing.T) {
+	b := newSlowBroker(t, 0) // 실제로 붙어야 단절 통지가 발생한다
 	var c *Client
 	done := make(chan struct{})
 	c = New(Options{
-		Addr:      "127.0.0.1:1",
+		Addr:      b.addr(),
 		ClientId:  "srv-round5b",
 		RetryWait: time.Hour,
 		OnDisconnect: func(_ *Client, _ error) {
@@ -104,16 +108,17 @@ func TestRound5_CloseInsideDisconnectCallbackDeadlocks(t *testing.T) {
 			close(done)
 		},
 	})
-	_ = c.Start()
+	if err := c.Start(); err != nil {
+		t.Fatalf("접속 실패: %v", err)
+	}
 
 	// 단절 통지를 유발한다.
 	go c.Close()
 
 	select {
 	case <-done:
-		t.Log("통지 안에서 Close를 불러도 빠져나왔다")
-	case <-time.After(2 * time.Second):
-		t.Log("재현됨: 단절 통지 안에서 Close를 부르면 스스로를 기다리며 멈춘다 — " +
-			"주석 경고만 있고 코드로 막지 않는다")
+		t.Log("확인됨: 단절 통지 안에서 Close를 불러도 빠져나온다")
+	case <-time.After(6 * time.Second):
+		t.Log("재현됨: 단절 통지 안에서 Close를 부르면 스스로를 기다리며 멈춘다")
 	}
 }
