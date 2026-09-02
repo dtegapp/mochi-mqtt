@@ -475,9 +475,11 @@ func (cl *Client) ReadPacket(fh *packets.FixedHeader) (pk packets.Packet, err er
 
 	atomic.AddInt64(&cl.ops.info.BytesReceived, int64(n))
 
-	// Decode the remaining packet values using a fresh copy of the bytes,
-	// otherwise the next packet will change the data of this one.
-	px := append([]byte{}, p[:]...)
+	// Taiminko 20260901: 여기서 p를 한 번 더 복사하던 것을 걷어냈다(px). p는 이 호출에서만
+	// 만들어지고 io.ReadFull이 bufio 내부 버퍼에서 p로 복사해오므로, 다음 패킷이 이 데이터를
+	// 덮어쓸 수 없다. pk.Payload가 p를 참조로 들고 있어도 안전하다.
+	// 🔴 p를 풀에서 꺼내 쓰도록 바꾸려면 이 복사를 되살려야 한다 — Payload가 참조이기 때문이다.
+	px := p
 	switch pk.FixedHeader.Type {
 	case packets.Connect:
 		err = pk.ConnectDecode(px)
